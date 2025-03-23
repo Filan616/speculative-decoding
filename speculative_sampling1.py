@@ -1,174 +1,196 @@
+from typing import List, Optional
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 import time
 import os
-from typing import List, Optional
-import warnings
-
-# Filter Flash Attention warnings
-warnings.filterwarnings("ignore", category=UserWarning)
 
 COLOR = {
     "reset": "\033[0m",
-    "draft": "\033[33m",
-    "accepted": "\033[32m",
-    "rejected": "\033[31m",
-    "main": "\033[36m"
+    "draft": "\033[33m",  # 黄色-草稿
+    "accepted": "\033[32m",  # 绿色-接受
+    "rejected": "\033[31m",  # 红色-拒绝
+    "main": "\033[36m"  # 青色-主模型修正
 }
 
 
-class RobustStoryGenerator:
-    def __init__(self, main_model="facebook/opt-1.3b", draft_model="facebook/opt-350m",
-                 device="auto", torch_dtype=torch.float16):
-        self.main_model = AutoModelForCausalLM.from_pretrained(
-            main_model, torch_dtype=torch_dtype, device_map=device)
-        self.draft_model = AutoModelForCausalLM.from_pretrained(
-            draft_model, torch_dtype=torch_dtype, device_map=device)
-        self.tokenizer = AutoTokenizer.from_pretrained(main_model)
+class SpeculativeSampling:
+    def __init__(self,
+                 target_model_name: str = "facebook/opt-1.3b",
+                 draft_model_name: str = "facebook/opt-350m",
+                 device: str = "cuda",
+                 torch_dtype: torch.dtype = torch.float16):
+
+        self.tokenizer = AutoTokenizer.from_pretrained(target_model_name)
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Enhanced generation parameters
-        self.config = {
-            "rep_penalty": 1.8,  # Stronger repetition penalty
-            "no_repeat_ngram": 4,  # Ban 4-gram repetition
-            "top_k": 60,
-            "top_p": 0.90,
-            "temp_range": (0.4, 0.8),
-            "min_new_words": 0.4  # New words ratio threshold
-        }
+        self.target_model = AutoModelForCausalLM.from_pretrained(
+            target_model_name,
+            torch_dtype=torch_dtype,
+            device_map=device
+        ).eval()
 
-    def generate(self, prompt, max_tokens=150, draft_len=5, threshold=0.35,
-                 display=True):
-        generated = prompt
-        token_count = 0
-        device = self.main_model.device
+        self.draft_model = AutoModelForCausalLM.from_pretrained(
+            draft_model_name,
+            torch_dtype=torch_dtype,
+            device_map=device
+        ).eval()
 
-        while token_count < max_tokens:
-            # Process inputs (add attention_mask)
-            inputs = self.tokenizer(
-                generated,
-                return_tensors="pt",
-                padding=True,
-                return_attention_mask=True
-            ).to(device)
+        self.vocab_size = self.target_model.config.vocab_size
+        self.K = 5
+        self.T = 100
 
-            try:
-                # Dynamic temperature adjustment
-                progress = token_count / max_tokens
-                temp = self._dynamic_temperature(progress)
+    def generate(self, prompt: str, max_length: int = 200) -> str:
+        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.target_model.device)
+        full_output = prompt
+        n = input_ids.size(1)
 
-                # Generate draft (enhanced parameters)
-                draft = self.draft_model.generate(
-                    inputs.input_ids,
-                    attention_mask=inputs.attention_mask,
-                    max_new_tokens=draft_len,
-                    temperature=temp,
-                    repetition_penalty=self.config["rep_penalty"],
-                    no_repeat_ngram_size=self.config["no_repeat_ngram"],
-                    do_sample=True,
-                    top_k=self.config["top_k"],
-                    top_p=self.config["top_p"],
-                    eos_token_id=self.tokenizer.eos_token_id
-                )
+        while n < max_length and n < self.T:
+            # 生成草案
+            draft_tokens = self._generate_draft(input_ids)
+            draft_text = self.tokenizer.decode(draft_tokens, skip_special_tokens=True)
 
-                # Safe validation
-                valid, correction = self._safe_validation(
-                    inputs.input_ids,
-                    draft,
-                    generated,
-                    threshold
-                )
+            # 验证过程
+            target_logits = self._get_target_logits(input_ids, draft_tokens)
+            accepted, correction = self._validate_tokens(input_ids, draft_tokens, target_logits)
 
-                # Update text
-                new_text = self._decode(valid) + correction
-                generated += new_text
-                token_count += len(self.tokenizer.encode(new_text))
+            # 构建显示内容
+            display_text = self._build_display(
+                full_output,
+                draft_tokens,
+                accepted,
+                correction
+            )
 
-                if display:
-                    self._display(generated, draft, valid, correction)
-                    time.sleep(0.3)
+            # 更新生成结果
+            new_tokens = accepted + [correction] if correction is not None else accepted
+            if new_tokens:
+                valid_tokens = [t for t in new_tokens if t < self.vocab_size]
+                new_text = self.tokenizer.decode(valid_tokens, skip_special_tokens=True)
+                full_output += new_text
+                new_tokens_tensor = torch.tensor([valid_tokens], device=input_ids.device)
+                input_ids = torch.cat([input_ids, new_tokens_tensor], dim=1)
+                n += len(valid_tokens)
 
-            except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
-                    torch.cuda.empty_cache()
-                    continue
-                raise
+            # 全接受时额外采样
+            if len(accepted) == self.K:
+                extra_token = self._sample_extra_token(input_ids)
+                if extra_token < self.vocab_size:
+                    input_ids = torch.cat([input_ids, torch.tensor([[extra_token]], device=input_ids.device)], dim=1)
+                    full_output += self.tokenizer.decode([extra_token], skip_special_tokens=True)
+                    n += 1
 
-        return generated
+            # 实时显示
+            self._refresh_display(display_text)
+            time.sleep(0.15)
 
-    def _dynamic_temperature(self, progress):
-        min_temp, max_temp = self.config["temp_range"]
-        return max_temp - (max_temp - min_temp) * progress ** 2  # Non-linear cooling
+        print("\n")  # 生成完成后换行
+        return full_output
 
-    def _safe_validation(self, input_ids, draft, context, threshold):
-        with torch.no_grad():
-            logits = self.main_model(draft[:, :-1]).logits
+    def _build_display(self,
+                       base: str,
+                       draft_tokens: List[int],
+                       accepted: List[int],
+                       correction: Optional[int]) -> str:
+        """构建带颜色标记的显示文本"""
+        accepted_text = self.tokenizer.decode(accepted, skip_special_tokens=True)
+        full_draft = self.tokenizer.decode(draft_tokens, skip_special_tokens=True)
 
-        valid_tokens = []
-        draft_tokens = draft[0][input_ids.shape[-1]:].tolist()
-        context_words = set(context.split())
+        # 计算各部分位置
+        accepted_part = full_draft[:len(accepted_text)]
+        rejected_part = full_draft[len(accepted_text):]
 
-        for idx, token in enumerate(draft_tokens):
-            if token in [self.tokenizer.eos_token_id, self.tokenizer.pad_token_id]:
-                break
+        display_str = base
+        display_str += f"{COLOR['accepted']}{accepted_part}{COLOR['reset']}"
+        display_str += f"{COLOR['rejected']}{rejected_part}{COLOR['reset']}"
 
-            # Probability check
-            pos = input_ids.shape[-1] - 1 + idx
-            prob = torch.softmax(logits[0, pos], -1)[token].item()
-            if prob < threshold:
-                break
+        if correction is not None:
+            correction_text = self.tokenizer.decode([correction], skip_special_tokens=True)
+            display_str += f"{COLOR['main']}{correction_text}{COLOR['reset']}"
 
-            # Safe text generation check
-            generated_part = self.tokenizer.decode(valid_tokens + [token])
-            if generated_part.strip():  # Prevent empty text
-                new_words = set(generated_part.split()) - context_words
-                total_words = len(generated_part.split())
-                if total_words == 0 or len(new_words) / total_words < self.config["min_new_words"]:
-                    break
+        return display_str
 
-            valid_tokens.append(token)
-
-        # Safe sampling
-        correction = ""
-        if len(valid_tokens) < len(draft_tokens):
-            try:
-                probs = torch.softmax(logits[0, pos], -1)
-                correction = self.tokenizer.decode([torch.multinomial(probs, 1).item()])
-            except:
-                correction = ""
-
-        return valid_tokens, correction
-
-    def _decode(self, tokens):
-        return self.tokenizer.decode(
-            tokens,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=True
-        )
-
-    def _display(self, base, draft, valid, correction):
+    def _refresh_display(self, text: str):
+        """刷新终端显示"""
         os.system('cls' if os.name == 'nt' else 'clear')
-        draft_text = self._decode(draft[0][len(base):])
-        valid_text = self._decode(valid)
-        rejected = draft_text[len(valid_text):]
+        print("\033[0;0H" + text, end="", flush=True)
 
-        display = (
-            f"{base}"
-            f"{COLOR['accepted']}{valid_text}"
-            f"{COLOR['rejected']}{rejected}"
-            f"{COLOR['main']}{correction}{COLOR['reset']}"
-        )
-        print("\033[0;0H" + display, end="", flush=True)
+    # 以下方法保持与之前实现一致
+    def _generate_draft(self, input_ids: torch.Tensor) -> List[int]:
+        draft = []
+        current_input = input_ids.clone()
+        for _ in range(self.K):
+            with torch.no_grad():
+                outputs = self.draft_model(current_input)
+                probs = torch.softmax(outputs.logits[:, -1, :], dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                token_id = next_token.item() if next_token.item() < self.vocab_size else self.tokenizer.eos_token_id
+                draft.append(token_id)
+                current_input = torch.cat([
+                    current_input,
+                    torch.tensor([[token_id]], device=current_input.device)
+                ], dim=1)
+        return draft
+
+    def _get_target_logits(self, base_input: torch.Tensor, draft_tokens: List[int]) -> List[torch.Tensor]:
+        sequences = [base_input]
+        for token in draft_tokens:
+            token = token if token < self.vocab_size else self.tokenizer.eos_token_id
+            token_tensor = torch.tensor([[token]], device=base_input.device)
+            seq = torch.cat([sequences[-1], token_tensor], dim=1)
+            sequences.append(seq)
+
+        all_logits = []
+        with torch.no_grad():
+            for seq in sequences:
+                logits = self.target_model(seq).logits[:, -1, :]
+                all_logits.append(logits)
+        return all_logits
+
+    def _validate_tokens(self,
+                         base_input: torch.Tensor,
+                         draft_tokens: List[int],
+                         target_logits: List[torch.Tensor]) -> (List[int], Optional[int]):
+        accepted = []
+        current_input = base_input.clone()
+
+        for t in range(len(draft_tokens)):
+            draft_token = draft_tokens[t] if draft_tokens[t] < self.vocab_size else self.tokenizer.eos_token_id
+            with torch.no_grad():
+                p = torch.softmax(self.draft_model(current_input).logits[:, -1, :], dim=-1)
+            q = torch.softmax(target_logits[t], dim=-1)
+
+            try:
+                ratio = q[0, draft_token] / p[0, draft_token]
+            except IndexError:
+                ratio = torch.tensor(0.0)
+
+            accept_prob = min(1.0, ratio.item())
+
+            if torch.rand(1).item() < accept_prob:
+                accepted.append(draft_token)
+                current_input = torch.cat([
+                    current_input,
+                    torch.tensor([[draft_token]], device=current_input.device)
+                ], dim=1)
+            else:
+                correction_probs = torch.clamp(q - p, min=0)
+                correction_probs[:, self.vocab_size:] = 0
+                correction_probs /= correction_probs.sum(dim=-1, keepdim=True)
+                correction = torch.multinomial(correction_probs[0], 1).item()
+                return accepted, correction
+
+        return accepted, None
+
+    def _sample_extra_token(self, input_ids: torch.Tensor) -> int:
+        with torch.no_grad():
+            logits = self.target_model(input_ids).logits[:, -1, :]
+            logits[:, self.vocab_size:] = -float('inf')
+            probs = torch.softmax(logits, dim=-1)
+            return torch.multinomial(probs[0], 1).item()
 
 
 if __name__ == "__main__":
-    # Usage example (optimized parameters)
-    generator = RobustStoryGenerator()
-    story = generator.generate(
-        "Write a short story. The story starts by: Once upon a time there was a farmer",
-        max_tokens=200,
-        draft_len=6,
-        threshold=0.4,
-        display=True
-    )
-    print("\n\nFinal Story:\n", story)
+    generator = SpeculativeSampling()
+    prompt = "In a magical library where books can rewrite reality"
+    result = generator.generate(prompt, max_length=300)
+    print("\nFinal Story:\n" + COLOR["main"] + result + COLOR["reset"])
