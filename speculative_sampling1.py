@@ -6,10 +6,10 @@ import os
 
 COLOR = {
     "reset": "\033[0m",
-    "draft": "\033[33m",  # 黄色-草稿
-    "accepted": "\033[32m",  # 绿色-接受
-    "rejected": "\033[31m",  # 红色-拒绝
-    "main": "\033[36m"  # 青色-主模型修正
+    "draft": "\033[33m",    # Yellow - Draft
+    "accepted": "\033[32m",  # Green - Accepted
+    "rejected": "\033[31m",  # Red - Rejected
+    "main": "\033[36m"       # Cyan - Correction by the target model
 }
 
 
@@ -36,8 +36,8 @@ class SpeculativeSampling:
         ).eval()
 
         self.vocab_size = self.target_model.config.vocab_size
-        self.K = 5
-        self.T = 100
+        self.K = 5  # Number of draft tokens per iteration
+        self.T = 100  # Maximum speculative decoding steps
 
     def generate(self, prompt: str, max_length: int = 200) -> str:
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.target_model.device)
@@ -45,15 +45,17 @@ class SpeculativeSampling:
         n = input_ids.size(1)
 
         while n < max_length and n < self.T:
-            # 生成草案
+            # Generate K draft tokens from the draft model
             draft_tokens = self._generate_draft(input_ids)
             draft_text = self.tokenizer.decode(draft_tokens, skip_special_tokens=True)
 
-            # 验证过程
+            # Get target model logits for the draft tokens
             target_logits = self._get_target_logits(input_ids, draft_tokens)
+
+            # Determine which draft tokens are accepted or rejected
             accepted, correction = self._validate_tokens(input_ids, draft_tokens, target_logits)
 
-            # 构建显示内容
+            # Build a color-coded display string for terminal visualization
             display_text = self._build_display(
                 full_output,
                 draft_tokens,
@@ -61,7 +63,7 @@ class SpeculativeSampling:
                 correction
             )
 
-            # 更新生成结果
+            # Update generated tokens and input
             new_tokens = accepted + [correction] if correction is not None else accepted
             if new_tokens:
                 valid_tokens = [t for t in new_tokens if t < self.vocab_size]
@@ -71,7 +73,7 @@ class SpeculativeSampling:
                 input_ids = torch.cat([input_ids, new_tokens_tensor], dim=1)
                 n += len(valid_tokens)
 
-            # 全接受时额外采样
+            # If all draft tokens are accepted, sample one more token
             if len(accepted) == self.K:
                 extra_token = self._sample_extra_token(input_ids)
                 if extra_token < self.vocab_size:
@@ -79,11 +81,11 @@ class SpeculativeSampling:
                     full_output += self.tokenizer.decode([extra_token], skip_special_tokens=True)
                     n += 1
 
-            # 实时显示
+            # Refresh display in the terminal
             self._refresh_display(display_text)
             time.sleep(0.15)
 
-        print("\n")  # 生成完成后换行
+        print("\n")  # Print newline after generation completes
         return full_output
 
     def _build_display(self,
@@ -91,11 +93,11 @@ class SpeculativeSampling:
                        draft_tokens: List[int],
                        accepted: List[int],
                        correction: Optional[int]) -> str:
-        """构建带颜色标记的显示文本"""
+        """Build a color-coded display string for terminal output."""
         accepted_text = self.tokenizer.decode(accepted, skip_special_tokens=True)
         full_draft = self.tokenizer.decode(draft_tokens, skip_special_tokens=True)
 
-        # 计算各部分位置
+        # Separate accepted and rejected parts from the draft
         accepted_part = full_draft[:len(accepted_text)]
         rejected_part = full_draft[len(accepted_text):]
 
@@ -110,12 +112,12 @@ class SpeculativeSampling:
         return display_str
 
     def _refresh_display(self, text: str):
-        """刷新终端显示"""
+        """Clear and refresh the terminal display."""
         os.system('cls' if os.name == 'nt' else 'clear')
         print("\033[0;0H" + text, end="", flush=True)
 
-    # 以下方法保持与之前实现一致
     def _generate_draft(self, input_ids: torch.Tensor) -> List[int]:
+        """Generate K draft tokens using the draft model."""
         draft = []
         current_input = input_ids.clone()
         for _ in range(self.K):
@@ -132,6 +134,7 @@ class SpeculativeSampling:
         return draft
 
     def _get_target_logits(self, base_input: torch.Tensor, draft_tokens: List[int]) -> List[torch.Tensor]:
+        """Get target model logits for each prefix extended with draft tokens."""
         sequences = [base_input]
         for token in draft_tokens:
             token = token if token < self.vocab_size else self.tokenizer.eos_token_id
@@ -150,6 +153,7 @@ class SpeculativeSampling:
                          base_input: torch.Tensor,
                          draft_tokens: List[int],
                          target_logits: List[torch.Tensor]) -> (List[int], Optional[int]):
+        """Use rejection sampling to determine which draft tokens to accept."""
         accepted = []
         current_input = base_input.clone()
 
@@ -182,6 +186,7 @@ class SpeculativeSampling:
         return accepted, None
 
     def _sample_extra_token(self, input_ids: torch.Tensor) -> int:
+        """Sample one extra token from the target model if all drafts were accepted."""
         with torch.no_grad():
             logits = self.target_model(input_ids).logits[:, -1, :]
             logits[:, self.vocab_size:] = -float('inf')
