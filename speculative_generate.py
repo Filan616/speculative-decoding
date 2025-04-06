@@ -17,7 +17,7 @@ class SpeculativeSampling:
     def __init__(self,
                  target_model_name: str = "facebook/opt-1.3b",
                  draft_model_name: str = "facebook/opt-350m",
-                 device: str = "cuda",
+                 device_map: str = "auto",
                  temperature: float = 0.7,
                  torch_dtype: torch.dtype = torch.float16):
 
@@ -27,13 +27,13 @@ class SpeculativeSampling:
         self.target_model = AutoModelForCausalLM.from_pretrained(
             target_model_name,
             torch_dtype=torch_dtype,
-            device_map=device
+            device_map=device_map
         ).eval()
 
         self.draft_model = AutoModelForCausalLM.from_pretrained(
             draft_model_name,
             torch_dtype=torch_dtype,
-            device_map=device
+            device_map=device_map
         ).eval()
 
         self.vocab_size = self.target_model.config.vocab_size
@@ -197,12 +197,13 @@ class SpeculativeSampling:
             return torch.multinomial(probs[0], 1).item()
 
 
-if __name__ == "__main__":
+"""if __name__ == "__main__":
     generator = SpeculativeSampling(
-    target_model_name="Qwen/Qwen2.5-1.5B",
-    draft_model_name="Qwen/Qwen2.5-0.5B",
-    temperature=0.8
-)
+        target_model_name="Qwen/Qwen2.5-1.5B",
+        draft_model_name="Qwen/Qwen2.5-0.5B",
+        device_map="auto",
+        temperature=0.8
+    )
     prompt = "In a magical library where books can rewrite reality"
     result = generator.generate(prompt, max_length=300)
-    print("\nFinal Story:\n" + COLOR["main"] + result + COLOR["reset"])
+    print("\nFinal Story:\n" + COLOR["main"] + result + COLOR["reset"])"""
