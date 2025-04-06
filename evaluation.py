@@ -16,7 +16,7 @@ print(f"Loaded {len(test_set)} tasks")
 sampler = SpeculativeSampling(
     target_model_name="Qwen/Qwen2.5-1.5B",
     draft_model_name="Qwen/Qwen2.5-0.5B",
-    device=device,
+    device_map="auto",
     torch_dtype=torch.float16
 )
 
